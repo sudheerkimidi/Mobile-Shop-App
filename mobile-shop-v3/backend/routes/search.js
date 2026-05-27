@@ -23,7 +23,7 @@ function cosineSimilarity(a, b) {
   return dot / (Math.sqrt(ma) * Math.sqrt(mb));
 }
 
-// ─── COLOR HISTOGRAM (always works, no API needed) ───────────
+// ─── COLOR HISTOGRAM ─────────────────────────────────────────
 function colorHistogram(buffer) {
   try {
     const bytes = new Uint8Array(buffer);
@@ -39,14 +39,10 @@ function colorHistogram(buffer) {
   } catch { return new Array(64).fill(0.015625); }
 }
 
-// ─── AI EMBEDDING (HuggingFace CLIP) ─────────────────────────
+// ─── AI EMBEDDING ────────────────────────────────────────────
 async function getAIEmbedding(buffer) {
   if (!process.env.HUGGINGFACE_TOKEN ||
-      process.env.HUGGINGFACE_TOKEN === 'hf_your_token_here' ||
-      process.env.HUGGINGFACE_TOKEN.length < 10) {
-    return null;
-  }
-
+      process.env.HUGGINGFACE_TOKEN === 'hf_your_token_here') return null;
   try {
     const resp = await fetch(
       'https://api-inference.huggingface.co/models/openai/clip-vit-base-patch32',
@@ -60,77 +56,40 @@ async function getAIEmbedding(buffer) {
         signal: AbortSignal.timeout(25000)
       }
     );
-
-    if (resp.status === 503) {
-      console.log('HuggingFace model loading...');
-      return null;
-    }
-
-    if (!resp.ok) {
-      console.log('HuggingFace returned:', resp.status);
-      return null;
-    }
-
+    if (!resp.ok) return null;
     const data = await resp.json();
-    if (Array.isArray(data) && data.length > 0) {
-      return data;
-    }
-    return null;
-  } catch (err) {
-    console.log('AI embedding error:', err.message);
-    return null;
-  }
+    return Array.isArray(data) && data.length > 0 ? data : null;
+  } catch { return null; }
 }
 
 // ─── VISUAL SEARCH ───────────────────────────────────────────
 router.post('/visual', authMiddleware, upload.single('image'), async (req, res) => {
   try {
-    if (!req.file) {
-      return res.status(400).json({ message: 'Please upload a photo' });
-    }
+    if (!req.file) return res.status(400).json({ message: 'Please upload a photo' });
 
-    console.log('Visual search started, size:', req.file.size, 'bytes');
-
-    // Step 1: Get embedding for uploaded customer photo
-    let queryEmbedding = null;
-    let searchMethod = 'color';
-
-    // Try AI first
-    queryEmbedding = await getAIEmbedding(req.file.buffer);
-    if (queryEmbedding) {
-      searchMethod = 'ai';
-      console.log('Using AI search, embedding length:', queryEmbedding.length);
-    } else {
-      // Use color histogram as reliable fallback
+    // Get embedding for uploaded photo
+    let queryEmbedding = await getAIEmbedding(req.file.buffer);
+    let searchMethod = 'ai';
+    if (!queryEmbedding) {
       queryEmbedding = colorHistogram(req.file.buffer);
       searchMethod = 'color';
-      console.log('Using color search, embedding length:', queryEmbedding.length);
     }
 
-    // Step 2: Get all products for this shop
+    // Get all products
     const allProducts = await Product.find({ shopId: req.user.userId });
-    console.log('Total products to compare:', allProducts.length);
-
     if (allProducts.length === 0) {
-      return res.json({
-        results: [],
-        searchMethod,
-        message: 'No products found. Please add products with photos first.'
-      });
+      return res.json({ results: [], searchMethod,
+        message: 'No products found. Add products with photos first.' });
     }
 
     const results = [];
-
     for (const product of allProducts) {
       let similarity = 0;
 
-      // If product has stored embedding of same type — use it
       if (product.embedding && product.embedding.length > 0 &&
           product.embedding.length === queryEmbedding.length) {
         similarity = cosineSimilarity(queryEmbedding, product.embedding);
-      }
-      // If no stored embedding OR different length — generate color comparison now
-      else if (product.images && product.images.length > 0) {
+      } else if (product.images && product.images.length > 0) {
         try {
           const imgResp = await fetch(product.images[0].url,
             { signal: AbortSignal.timeout(8000) });
@@ -138,19 +97,14 @@ router.post('/visual', authMiddleware, upload.single('image'), async (req, res) 
           const productColor = colorHistogram(imgBuf);
           const queryColor = colorHistogram(req.file.buffer);
           similarity = cosineSimilarity(queryColor, productColor);
-
-          // Save this embedding for future use
+          // Save for future
           setImmediate(async () => {
             try {
-              await Product.findByIdAndUpdate(product._id, {
-                embedding: productColor,
-                embeddingType: 'color'
-              });
-            } catch (e) {}
+              await Product.findByIdAndUpdate(product._id,
+                { embedding: productColor, embeddingType: 'color' });
+            } catch(e) {}
           });
-        } catch (e) {
-          console.log('Could not fetch product image:', e.message);
-        }
+        } catch(e) { similarity = 0; }
       }
 
       results.push({
@@ -160,21 +114,41 @@ router.post('/visual', authMiddleware, upload.single('image'), async (req, res) 
       });
     }
 
-    // Sort by similarity, best first
+    // Sort by similarity
     results.sort((a, b) => b.similarity - a.similarity);
 
-    // Return top 10
-    const topResults = results.slice(0, 10);
+    // ─── SMART FILTERING ─────────────────────────────────────
+    // Only show genuinely matching products
+    let filtered = [];
+    
+    if (results.length > 0) {
+      const topScore = results[0].similarity;
+      
+      // If best match is very high (>80%) — show only high matches
+      if (topScore > 0.80) {
+        filtered = results.filter(r => r.similarity > 0.70);
+      }
+      // If best match is good (60-80%) — show matches within 20% of top
+      else if (topScore > 0.60) {
+        filtered = results.filter(r => r.similarity > 0.50);
+      }
+      // If best match is low — show top 3 only with warning
+      else {
+        filtered = results.slice(0, 3);
+      }
+    }
 
-    console.log('Visual search complete. Top match:', topResults[0]?.matchPercent + '%');
+    // Maximum 8 results
+    const topResults = filtered.slice(0, 8);
 
     res.json({
       results: topResults,
       count: topResults.length,
       searchMethod,
+      topMatchPercent: topResults[0]?.matchPercent || 0,
       message: topResults.length > 0
-        ? `Found ${topResults.length} matches using ${searchMethod === 'ai' ? 'AI' : 'color'} search`
-        : 'No matches found'
+        ? `Found ${topResults.length} matching cases`
+        : 'No close matches found. Try a clearer photo.'
     });
 
   } catch (err) {
@@ -191,36 +165,27 @@ router.post('/regenerate-all', authMiddleware, async (req, res) => {
       'images.0': { $exists: true }
     });
 
-    console.log('Regenerating', products.length, 'products');
     let done = 0;
-
     for (const product of products) {
       try {
         const imgResp = await fetch(product.images[0].url,
           { signal: AbortSignal.timeout(10000) });
         const buf = Buffer.from(await imgResp.arrayBuffer());
-
-        // Try AI first, fallback to color
         let embedding = await getAIEmbedding(buf);
         let embeddingType = 'ai';
         if (!embedding) {
           embedding = colorHistogram(buf);
           embeddingType = 'color';
         }
-
         await Product.findByIdAndUpdate(product._id, { embedding, embeddingType });
         done++;
-        console.log(`✅ ${product.name} (${embeddingType})`);
         await new Promise(r => setTimeout(r, 500));
-      } catch (e) {
-        console.log(`❌ ${product.name}:`, e.message);
-      }
+      } catch(e) {}
     }
 
     res.json({
-      message: `✅ Done! ${done} of ${products.length} products updated`,
-      done,
-      total: products.length
+      message: `Done! ${done} of ${products.length} products updated`,
+      done, total: products.length
     });
   } catch (err) {
     res.status(500).json({ message: 'Failed: ' + err.message });
